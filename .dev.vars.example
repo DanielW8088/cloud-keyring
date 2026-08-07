@@ -1,0 +1,3 @@
+ADMIN_PASSWORD="replace-with-at-least-16-random-characters"
+SESSION_SECRET="replace-with-at-least-32-random-characters"
+SITE_NAME="Cloud Keyring"

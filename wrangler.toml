@@ -1,0 +1,12 @@
+name = "cloud-keyring"
+pages_build_output_dir = "public"
+compatibility_date = "2026-08-01"
+
+[vars]
+SITE_NAME = "Cloud Keyring"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cloud-keyring"
+database_id = "2c31bf5f-8742-48e1-af1c-7e383e90c24f"
+migrations_dir = "migrations"

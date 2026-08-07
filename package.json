@@ -1,0 +1,28 @@
+{
+  "name": "cloud-keyring",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Secure SSH public key directory for Cloudflare Pages and Workers",
+  "scripts": {
+    "dev": "wrangler dev -c wrangler.worker.toml",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test",
+    "deploy:worker": "wrangler deploy -c wrangler.worker.toml",
+    "deploy:pages": "wrangler pages deploy public --project-name cloud-keyring",
+    "db:migrate:local": "wrangler d1 migrations apply cloud-keyring --local -c wrangler.worker.toml",
+    "db:migrate:worker": "wrangler d1 migrations apply cloud-keyring --remote -c wrangler.worker.toml",
+    "db:migrate:pages": "wrangler d1 migrations apply cloud-keyring --remote -c wrangler.toml"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260804.1",
+    "@types/node": "22.20.1",
+    "typescript": "5.9.2",
+    "vitest": "3.2.7",
+    "wrangler": "4.120.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
