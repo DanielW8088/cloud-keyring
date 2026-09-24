@@ -4,6 +4,7 @@ import {
   hasValidSession,
   isSameOrigin,
   passwordsEqual,
+  rateLimitSubject,
 } from "../src/security";
 
 const SECRET = "a-secure-test-secret-that-is-long-enough";
@@ -42,5 +43,18 @@ describe("session security", () => {
         }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("rateLimitSubject", () => {
+  it("groups IPv6 addresses by /64 and keeps IPv4 addresses distinct", () => {
+    expect(rateLimitSubject("203.0.113.7")).toBe("203.0.113.7");
+    expect(rateLimitSubject("::ffff:203.0.113.7")).toBe("203.0.113.7");
+    expect(rateLimitSubject("2001:db8:0:1::1")).toBe("2001:db8:0:1::/64");
+    expect(rateLimitSubject("2001:0DB8:0000:0001:ffff:1:2:3")).toBe("2001:db8:0:1::/64");
+    expect(rateLimitSubject("2001:db8::1")).toBe("2001:db8:0:0::/64");
+    expect(rateLimitSubject("::1")).toBe("0:0:0:0::/64");
+    expect(rateLimitSubject("64:ff9b::192.0.2.1")).toBe("64:ff9b:0:0::/64");
+    expect(rateLimitSubject("not-an-address")).toBe("not-an-address");
   });
 });

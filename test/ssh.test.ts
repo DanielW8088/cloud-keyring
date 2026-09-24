@@ -43,4 +43,15 @@ describe("parsePublicKey", () => {
       "supported OpenSSH public key",
     );
   });
+
+  it("rejects Object.prototype property names as key types", async () => {
+    for (const type of ["toString", "__proto__", "constructor", "hasOwnProperty"]) {
+      const field = Buffer.alloc(4 + type.length);
+      field.writeUInt32BE(type.length, 0);
+      field.write(type, 4);
+      await expect(parsePublicKey(`${type} ${field.toString("base64")} x`)).rejects.toThrow(
+        "supported OpenSSH public key",
+      );
+    }
+  });
 });

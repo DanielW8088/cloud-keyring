@@ -34,37 +34,25 @@ Cloud Keyring 提供受保护的网页管理后台、公开身份页、原始 `.
 
 ## 安装器行为
 
-生成的安装器只管理一个身份对应的区块：
+每个身份在 `authorized_keys` 中拥有一个区块。区块用身份不可变的 ID 标记，而不是 Handle，因此身份改名不会遗留公钥：
 
 ```text
-# >>> cloud-keyring/alice >>>
+# >>> cloud-keyring:id=3f2a...c9 >>>
+# @alice: managed by Cloud Keyring; edits inside this block are overwritten
 ssh-ed25519 AAAA... alice-laptop
-# <<< cloud-keyring/alice <<<
+# <<< cloud-keyring:id=3f2a...c9 <<<
 ```
 
-修改 `authorized_keys` 前会创建备份：
+安装器的行为：
 
-```text
-~/.ssh/authorized_keys.keyring.bak
-```
+- 只替换自己的区块，从不修改其他身份的区块。因此从一个身份撤销公钥，不会删除另一个身份发布的同一把公钥。
+- 删除所有区块之外、与已发布公钥相同的普通副本。比较依据是 `算法 + Base64 公钥主体`，忽略注释和空白。
+- 如果已发布的公钥在区块之外带有 `restrict`、`command=`、`from=` 等 `authorized_keys` 选项，或以 `cert-authority` 行出现，**安装器会拒绝执行**。写入一份不受限制的副本会让这些限制失效。此时文件保持不变：删除带选项的那一行，或停止发布该公钥，然后重新运行。
+- 如果自己的区块缺少结束标记，不做任何修改并退出。
+- 迁移旧版本写入的区块（`# >>> cloud-keyring/<handle> >>>`），范围是该身份用过的所有 Handle。属于其他 Handle 的旧区块会保留，并给出提示。
+- 只在结果不同时写入。每次修改前保存带时间戳的备份 `~/.ssh/authorized_keys.keyring-<UTC 时间>.XXXXXX`，保留最近 10 份。
 
-公钥去重使用以下身份：
-
-```text
-算法 + Base64 公钥主体
-```
-
-注释、空白以及受支持的 `authorized_keys` options 不会让重复公钥被视为不同。例如下面三行会被识别为同一把公钥：
-
-```text
-ssh-ed25519 AAAAC3... old-comment
-ssh-ed25519 AAAAC3... new-comment
-restrict ssh-ed25519 AAAAC3... option-comment
-```
-
-安装器会删除管理区块外的等价副本，只写入一次当前发布版本，保留不相关公钥和注释，并且重复运行保持幂等。
-
-不同 Handle 的管理区块相互独立。从一个身份撤销公钥，不会删除另一个身份有意发布的相同公钥。
+Handle 永久有效。身份用过的每个 Handle 都会一直指向该身份的安装器，且不会再分配给其他身份。身份被隐藏或删除后，它的 `.sh` 端点返回撤销脚本，删除对应区块；定时同步的服务器会自动收敛。在引入 Handle 记录之前就已停用的 Handle，会返回只删除其旧区块的脚本。
 
 ## 安全模型
 
@@ -72,12 +60,14 @@ restrict ssh-ed25519 AAAAC3... option-comment
 - `ADMIN_PASSWORD` 和 `SESSION_SECRET` 使用 Cloudflare Secrets，不作为源码变量提交。
 - 会话使用 HMAC 签名，以及有效期 8 小时的 `HttpOnly; Secure; SameSite=Strict` Cookie。
 - 每个管理写操作都要求有效会话以及与请求 URL 完全同源的 `Origin`。
-- 登录失败按照客户端 IP 的隐私化 HMAC 哈希进行限流。
-- 审计事件保存操作和执行者哈希，不保存原始 IP 或口令。
+- 每次登录尝试都会在核对口令之前原子地记入 D1，按客户端 IPv4 地址或 IPv6 /64 计数，以 HMAC 哈希存储。5 次尝试后锁定 30 秒，此后每次失败锁定时间翻倍，最长 15 分钟。登录成功或 24 小时内没有尝试时计数清零。
+- 请求体以流的方式读取，超过 20 KB 立即中止。
+- 审计事件保存操作和执行者哈希，不保存原始 IP 或口令。登录失败与管理事件分开统计，不会把管理事件挤出列表。
+- 管理后台和 API 不会在 `*.pages.dev` 或 `*.workers.dev` 域名上提供，因为自定义域名上的 Access 策略覆盖不到这些域名。设置 `CANONICAL_ORIGIN` 后，只在该 Origin 上提供。
 - 公钥按照 SSH 二进制结构解析。解析器拒绝 DSA、低于 2048 位的 RSA、私钥、多行输入、错误编码以及内外算法不一致的密钥。
 - 动态 HTML 全部转义，Content Security Policy 不允许内联脚本。
 - 公开身份、`.keys` 和 `.sh` 响应使用 `Cache-Control: no-store`，避免边缘缓存继续提供已撤销公钥。
-- 安装器使用 `mktemp`、`trap`、严格权限、本地备份和原子替换。
+- 安装器使用 `mktemp`、`trap`、严格权限、带时间戳的备份和原子替换，并且不会解除已有的 `authorized_keys` 限制。
 
 内置的单管理员登录适合个人部署或小型可信团队。生产环境建议额外使用 Cloudflare Access 和 MFA 保护 `/admin*` 与 `/api/*`。
 
@@ -85,7 +75,7 @@ restrict ssh-ed25519 AAAAC3... option-comment
 
 ## 环境要求
 
-- Node.js 22 或更高版本
+- Node.js 22.13 或更高版本
 - Cloudflare 账户
 - 如需自定义域名，需要由 Cloudflare 管理的 Zone
 - 通过 `npx wrangler login` 登录 Wrangler，或在 CI 中配置有限权限的 API Token
@@ -127,6 +117,17 @@ custom_domain = true
 
 部署时 Cloudflare 会自动创建 DNS 记录和证书。该主机名必须属于同一 Cloudflare 账户中的有效 Zone，并且不能存在冲突的 CNAME 记录。
 
+### 设置规范 Origin
+
+在 `wrangler.worker.toml` 或 `wrangler.toml` 的 `[vars]` 中，把 `CANONICAL_ORIGIN` 设为公开的 HTTPS Origin：
+
+```toml
+[vars]
+CANONICAL_ORIGIN = "https://keys.example.com"
+```
+
+设置后，管理后台和 API 只在该 Origin 上提供；其他域名（包括 Pages 预览地址）上的公开页面会重定向过来，安装命令也始终指向它。未设置时，`*.pages.dev` 和 `*.workers.dev` 上仍会拒绝访问管理后台。本地开发时保持为空。
+
 ### 配置本地 Secret
 
 将 `.dev.vars.example` 复制为 `.dev.vars`，并设置两个相互独立的高熵值：
@@ -164,7 +165,12 @@ npm run check
 npm audit
 ```
 
-安装器测试会在隔离的临时 `HOME` 中使用 `/bin/sh` 执行生成脚本，覆盖忽略注释的去重、受支持 options、幂等执行，以及完全撤销但不删除无关条目的场景。
+安装器测试会在隔离的临时 `HOME` 中，分别用系统上已有的 `/bin/sh`、`dash` 和 `bash` 执行生成的脚本，覆盖去重、拒绝解除选项限制、身份之间互不影响、改名、撤销、备份和幂等执行。应用测试在 `node:sqlite` 上运行真实的迁移和 SQL，包括并发登录尝试。
+
+## 从 1.0.0 升级
+
+1. 部署新代码之前，用对应目标的迁移脚本应用 `migrations/0002_identity_lifecycle.sql`。
+2. 旧版安装器会去掉已发布公钥副本上的 `authorized_keys` 选项，会删除与其他身份共享的公钥，并且在改名、隐藏或删除身份后遗留公钥。请在每台运行过安装器的主机上检查 `authorized_keys` 和 `authorized_keys.keyring.bak`，确认是否丢失了 `restrict`、`command=`、`from=` 选项，以及是否残留已改名或已移除身份的 `cloud-keyring/<handle>` 区块，然后重新运行当前版本的安装器。
 
 ## 部署到 Workers
 
@@ -253,6 +259,8 @@ curl -fsSL https://keys.example.com/alice.sh | sh
 - 管理员权限变化时，使用 `wrangler secret put` 轮换 `ADMIN_PASSWORD`。
 - 轮换 `SESSION_SECRET` 可以立即注销全部现有登录会话。
 - 撤销公钥后，检查 `/<handle>.keys`，并在每台目标机器上重新运行安装器。
+- 隐藏或删除身份后，各主机下次运行安装器时会撤销其公钥。由于隐藏身份的 `.sh` 仍会返回撤销脚本，外部可以得知该 Handle 存在。
+- Handle 不能释放或重新分配。为新成员选择新的 Handle。
 - 备份 D1，并定期测试恢复流程。
 - 为管理端点启用 Cloudflare Access、MFA、WAF 规则和速率限制。
 - 通过管理后台检查审计事件。
@@ -269,7 +277,7 @@ src/security.ts         会话、常量时间比较和隐私哈希
 src/ssh.ts              SSH 公钥解析和指纹
 src/views.ts            服务端 HTML
 src/worker.ts           Workers 入口
-test/                   安全、SSH 解析和 Shell 安装器测试
+test/                   安全、SSH 解析、安装器和应用测试
 wrangler.toml           Pages 配置
 wrangler.worker.toml    Workers 和自定义域名配置
 ```

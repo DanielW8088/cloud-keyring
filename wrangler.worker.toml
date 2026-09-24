@@ -2,9 +2,15 @@ name = "cloud-keyring"
 main = "src/worker.ts"
 compatibility_date = "2026-08-01"
 workers_dev = false
+preview_urls = false
+
+[[routes]]
+pattern = "keys.1881.club"
+custom_domain = true
 
 [vars]
 SITE_NAME = "Cloud Keyring"
+CANONICAL_ORIGIN = "https://keys.1881.club"
 
 [[d1_databases]]
 binding = "DB"

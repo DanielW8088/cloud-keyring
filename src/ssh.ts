@@ -101,6 +101,8 @@ function validateBlob(type: string, bytes: Uint8Array): void {
     if (point.length !== 65 || point[0] !== 4 || reader.field().length === 0) {
       throw new Error("Invalid ECDSA security key encoding");
     }
+  } else {
+    throw new Error("Unsupported SSH key type");
   }
 
   if (!reader.done()) throw new Error("Unexpected data in SSH public key blob");
@@ -119,7 +121,7 @@ export async function parsePublicKey(input: string): Promise<ParsedPublicKey> {
   const parts = input.trim().split(/[\t ]+/);
   const type = parts[0] ?? "";
   const blob = parts[1] ?? "";
-  if (!(type in ALGORITHMS) || !blob) {
+  if (!Object.hasOwn(ALGORITHMS, type) || !blob) {
     throw new Error("Use a supported OpenSSH public key without authorized_keys options");
   }
   const comment = parts.slice(2).join(" ");
@@ -132,7 +134,7 @@ export async function parsePublicKey(input: string): Promise<ParsedPublicKey> {
   return {
     line: [type, blob, comment].filter(Boolean).join(" "),
     type,
-    typeLabel: ALGORITHMS[type] ?? type,
+    typeLabel: keyTypeLabel(type),
     blob,
     comment,
     fingerprint,
@@ -140,5 +142,5 @@ export async function parsePublicKey(input: string): Promise<ParsedPublicKey> {
 }
 
 export function keyTypeLabel(type: string): string {
-  return ALGORITHMS[type] ?? type;
+  return Object.hasOwn(ALGORITHMS, type) ? (ALGORITHMS[type] ?? type) : type;
 }

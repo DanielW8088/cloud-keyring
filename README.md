@@ -34,37 +34,25 @@ Cloud Keyring provides a protected web console for managing identities and publi
 
 ## Installer Behavior
 
-The generated installer manages only the block associated with one identity:
+Each identity owns one block in `authorized_keys`. The block is marked with the identity's immutable ID instead of its handle, so renaming an identity does not orphan its keys:
 
 ```text
-# >>> cloud-keyring/alice >>>
+# >>> cloud-keyring:id=3f2a...c9 >>>
+# @alice: managed by Cloud Keyring; edits inside this block are overwritten
 ssh-ed25519 AAAA... alice-laptop
-# <<< cloud-keyring/alice <<<
+# <<< cloud-keyring:id=3f2a...c9 <<<
 ```
 
-Before changing `authorized_keys`, it creates:
+The installer:
 
-```text
-~/.ssh/authorized_keys.keyring.bak
-```
+- Replaces only its own block. Blocks of other identities are never modified, so revoking a key from one identity does not remove a copy published by another.
+- Removes plain copies of a published key outside all blocks. Keys are compared by `algorithm + Base64 public key body`, ignoring comments and spacing.
+- **Refuses to run** when a published key already appears outside the blocks with `authorized_keys` options such as `restrict`, `command=`, or `from=`, or as a `cert-authority` line. An unrestricted copy would lift those restrictions. The file is left untouched: remove the options line or stop publishing that key, then run the installer again.
+- Aborts without changes if its own block has no end marker.
+- Migrates blocks written by earlier versions (`# >>> cloud-keyring/<handle> >>>`) for every handle the identity has used. It keeps legacy blocks that belong to other handles and reports them.
+- Writes only when the result differs. Before each change it saves a timestamped backup, `~/.ssh/authorized_keys.keyring-<UTC time>.XXXXXX`, and keeps the ten most recent.
 
-Key deduplication uses the key identity:
-
-```text
-algorithm + Base64 public key body
-```
-
-Comments, spacing, and supported `authorized_keys` options do not make duplicate copies distinct. For example, these are treated as the same key:
-
-```text
-ssh-ed25519 AAAAC3... old-comment
-ssh-ed25519 AAAAC3... new-comment
-restrict ssh-ed25519 AAAAC3... option-comment
-```
-
-The installer removes equivalent copies outside its managed block, writes the currently published form once, preserves unrelated keys and comments, and remains idempotent across repeated runs.
-
-Management blocks for different handles remain independent. Revoking a key from one handle does not remove a copy intentionally published by another handle.
+Handles are permanent. Every handle an identity has used keeps resolving to that identity's installer and is never assigned to another identity. When an identity is hidden or deleted, its `.sh` endpoint serves a revocation script that removes its block, so hosts that sync on a schedule converge. Handles retired before handle tracking existed serve a script that removes their legacy block.
 
 ## Security Model
 
@@ -72,12 +60,14 @@ Management blocks for different handles remain independent. Revoking a key from 
 - `ADMIN_PASSWORD` and `SESSION_SECRET` are Cloudflare Secrets, not source-controlled variables.
 - Sessions use HMAC signatures and `HttpOnly; Secure; SameSite=Strict` cookies with an eight-hour lifetime.
 - Every management write requires a valid session and an exact same-origin `Origin` header.
-- Failed logins are rate-limited using a privacy-preserving HMAC hash of the client IP.
-- Audit events store actions and actor hashes, not raw client IP addresses or passwords.
+- Each login attempt is recorded atomically in D1 before the password check, per client IPv4 address or IPv6 /64, stored as an HMAC hash. After five attempts the client is locked out for 30 seconds, doubling with each further failure up to 15 minutes. The counter resets after a successful login or 24 hours without attempts.
+- Request bodies are read as a stream and cancelled once they exceed 20 KB.
+- Audit events store actions and actor hashes, not raw client IP addresses or passwords. Failed logins are counted separately from management events so they cannot push them out of view.
+- The console and API are never served on `*.pages.dev` or `*.workers.dev` hostnames, which Access policies on a custom domain do not cover. With `CANONICAL_ORIGIN` set, they are served only on that origin.
 - Public keys are parsed as SSH binary structures. The parser rejects DSA, RSA keys below 2048 bits, private keys, multiline input, malformed encodings, and mismatched inner and outer algorithms.
 - Dynamic HTML is escaped and the Content Security Policy does not allow inline scripts.
 - Public identity, `.keys`, and `.sh` responses use `Cache-Control: no-store` so revocations are not retained in edge caches.
-- The installer uses `mktemp`, `trap`, restrictive permissions, a local backup, and atomic replacement.
+- The installer uses `mktemp`, `trap`, restrictive permissions, timestamped backups, and atomic replacement, and never lifts existing `authorized_keys` restrictions.
 
 The built-in single-admin login is appropriate for a personal deployment or a small trusted team. For production, protect `/admin*` and `/api/*` with Cloudflare Access and MFA as an additional layer.
 
@@ -85,7 +75,7 @@ See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for the upstream audit, implemented c
 
 ## Requirements
 
-- Node.js 22 or newer
+- Node.js 22.13 or newer
 - A Cloudflare account
 - A Cloudflare-managed zone for a custom domain
 - Wrangler authentication through `npx wrangler login` or a scoped API token in CI
@@ -127,6 +117,17 @@ custom_domain = true
 
 Cloudflare creates the DNS record and certificate during deployment. The hostname must belong to an active zone in the same Cloudflare account and must not already have a conflicting CNAME record.
 
+### Set the Canonical Origin
+
+Set `CANONICAL_ORIGIN` to the public HTTPS origin in the `[vars]` section of `wrangler.worker.toml` or `wrangler.toml`:
+
+```toml
+[vars]
+CANONICAL_ORIGIN = "https://keys.example.com"
+```
+
+When it is set, the console and API are served only on that origin, other hostnames (including Pages preview URLs) redirect public pages to it, and install commands always point at it. When it is unset, the console is still refused on `*.pages.dev` and `*.workers.dev`. Leave it unset for local development.
+
 ### Configure Local Secrets
 
 Copy `.dev.vars.example` to `.dev.vars` and set independent high-entropy values:
@@ -164,7 +165,12 @@ npm run check
 npm audit
 ```
 
-The installer tests execute the generated script with `/bin/sh` in an isolated temporary `HOME`. They cover comment-insensitive deduplication, supported options, idempotency, and full revocation without deleting unrelated entries.
+The installer tests run generated scripts in isolated temporary `HOME` directories under `/bin/sh`, `dash`, and `bash`, whichever are installed. They cover deduplication, refusal to lift options, isolation between identities, renames, revocation, backups, and idempotency. The application tests run the real migrations and SQL on `node:sqlite`, including concurrent login attempts.
+
+## Upgrading from 1.0.0
+
+1. Apply `migrations/0002_identity_lifecycle.sql` with the migrate script for your target before deploying the new code.
+2. Earlier installers dropped `authorized_keys` options from copies of published keys, removed keys shared with other identities, and left keys behind after renames, hiding, or deletion. On every host that ran an installer, check `authorized_keys` and `authorized_keys.keyring.bak` for lost `restrict`, `command=`, or `from=` options and for `cloud-keyring/<handle>` blocks of renamed or removed identities. Then run the current installer again.
 
 ## Deploy to Workers
 
@@ -253,6 +259,8 @@ Running remote shell code is a supply-chain decision. Review the script first an
 - Rotate `ADMIN_PASSWORD` with `wrangler secret put` when administrator access changes.
 - Rotate `SESSION_SECRET` to invalidate all existing login sessions immediately.
 - After revoking a key, inspect `/<handle>.keys` and rerun the installer on every target machine.
+- Hiding or deleting an identity revokes its keys the next time each host runs its installer. Because a hidden handle still answers `.sh` with a revocation script, the handle's existence is visible.
+- Handles cannot be released or reassigned. Choose new handles for new people.
 - Back up D1 and regularly test recovery.
 - Enable Cloudflare Access, MFA, WAF rules, and rate limiting for the management endpoints.
 - Review audit events from the admin console.
@@ -269,7 +277,7 @@ src/security.ts         Sessions, constant-time comparison, privacy hashes
 src/ssh.ts              SSH key parsing and fingerprints
 src/views.ts            Server-rendered HTML
 src/worker.ts           Workers entrypoint
-test/                   Security, SSH parser, and shell installer tests
+test/                   Security, SSH parser, installer, and application tests
 wrangler.toml           Pages configuration
 wrangler.worker.toml    Workers and custom-domain configuration
 ```

@@ -59,13 +59,13 @@
 | 私钥泄露 | 产品中不存在私钥字段或导入入口；多行及私钥头会被拒绝 |
 | 弱或伪造公钥 | 解析 SSH 二进制字段，校验内外算法、字段长度、曲线和 RSA 最低位数 |
 | 管理员认证 | 高熵 Secret、HMAC 会话、HttpOnly/Secure/Strict Cookie、8 小时有效期 |
-| 暴力破解 | 按 HMAC 隐私化 IP 在 D1 中记录失败并指数退避 |
+| 暴力破解 | 核对口令前在 D1 中原子地登记尝试（IPv4 按地址、IPv6 按 /64，HMAC 隐私化），锁定时间逐次翻倍 |
 | CSRF | 所有管理写请求要求有效会话和与 URL 完全一致的 `Origin` |
 | XSS | 服务器端转义；脚本为同源外部资源；严格 CSP 无 `unsafe-inline` |
 | SQL 注入 | 所有动态值通过 D1 prepared statements 绑定 |
 | 撤销延迟 | 动态公开响应使用 `Cache-Control: no-store` |
 | 审计隐私 | 记录动作、目标和 HMAC actor hash，不保存原始 IP 或管理员口令 |
-| 安装器完整性 | 安全 Handle、受引号保护 heredoc、`mktemp`、`trap`、原子替换和本地备份 |
+| 安装器完整性 | 按不可变身份 ID 标记区块、不改动其他身份区块、拒绝解除已有 options 限制、受引号保护 heredoc、`mktemp`、`trap`、原子替换和带时间戳的备份 |
 | 供应链 | 精确依赖版本、package-lock、`npm audit`、Worker 和 Pages 双目标构建检查 |
 
 ## 剩余风险
@@ -83,3 +83,24 @@
 - 每月复查 npm 与 Cloudflare 安全公告。
 - 每季度测试 D1 恢复、管理员 Secret 轮换和公钥紧急撤销流程。
 - 每次修改安装器后，在隔离 HOME 中验证添加、重复执行、撤销、保留非管理区公钥和备份恢复。
+
+## 2026-09-24 实现复查与修复
+
+对 1.0.0 实现的复查发现以下问题，均已在代码中修复，并补充了回归测试。安装器在 BSD awk、gawk、mawk 以及 dash、bash 下验证；登录限流在本地 D1（workerd）上验证了并发场景。
+
+| 等级 | 问题 | 修复 |
+| --- | --- | --- |
+| 高 | 同步时删除区块外带 `restrict`/`command=`/`from=` 的同一公钥，写入不受限副本，导致限制失效 | 发现冲突时安装器拒绝执行、不修改文件；只删除不带选项的普通副本 |
+| 高 | 区块以可修改的 Handle 标记；改名、隐藏、删除后无法撤销；Handle 可被新身份复用 | 区块改用不可变 uid 标记；新增 `identity_handles` 永久保留 Handle；隐藏或删除后 `.sh` 返回撤销脚本；迁移旧格式区块 |
+| 中 | 登录限流先读后写，可并发绕过；锁定到期后计数重置，退避不递增 | 单条 `UPDATE … RETURNING` 在核对口令前原子占用尝试额度；计数 24 小时无尝试才重置；IPv6 按 /64 计数 |
+| 中 | 缺少 `Content-Length` 时读取整个请求体 | 以流的方式读取，超过 20 KB 立即取消 |
+| 中 | 同步一个身份会删除其他身份区块中的同一公钥 | 安装器只处理自己的区块，其他区块原样保留 |
+| 低 | 公钥类型白名单接受 `toString` 等原型属性名 | 改用 `Object.hasOwn`，未知类型在 `validateBlob` 中报错 |
+| 低 | 错误页未转义 `error.message` | 统一通过 `renderError` 转义 |
+| 低 | `*.pages.dev`/`*.workers.dev` 上的管理后台绕过自定义域名的 Access | 平台域名上不提供管理后台；新增 `CANONICAL_ORIGIN` 限定唯一 Origin |
+| 低 | 登录失败事件可把管理事件挤出后台列表 | 管理事件与登录失败分开查询，登录失败只显示 24 小时计数 |
+| 低 | 每次运行覆盖唯一的备份 | 仅在内容变化时写入，备份带时间戳并保留最近 10 份 |
+| 依赖 | wrangler→miniflare→sharp、vitest 的已知公告 | 升级到 wrangler 4.138.0、vitest 5.0.1，`npm audit` 为 0 |
+
+已经运行过旧版安装器的主机仍需人工核查，见 README 的"从 1.0.0 升级"。
+

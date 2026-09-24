@@ -108,3 +108,30 @@ export function isSameOrigin(request: Request): boolean {
 export async function privacyHash(secret: string, value: string): Promise<string> {
   return toBase64Url(await hmac(secret, `actor:${value}`)).slice(0, 22);
 }
+
+function ipv6Prefix64(address: string): string | null {
+  const halves = address.toLowerCase().split("%")[0]?.split("::") ?? [];
+  if (halves.length < 1 || halves.length > 2) return null;
+  const groups = (part: string | undefined) => (part ? part.split(":") : []);
+  const head = groups(halves[0]);
+  const tail = groups(halves[1]);
+  // An embedded IPv4 suffix occupies the last 32 bits, outside the /64 prefix.
+  const last = tail.length ? tail : head;
+  if (last.at(-1)?.includes(".")) last.splice(-1, 1, "0", "0");
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const all = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill("0"), ...tail];
+  if (!all.every((group) => /^[0-9a-f]{1,4}$/.test(group))) return null;
+  return `${all.slice(0, 4).map((group) => parseInt(group, 16).toString(16)).join(":")}::/64`;
+}
+
+/**
+ * Groups client addresses for rate limiting. IPv6 clients usually control a
+ * whole /64, so limiting individual addresses would let them rotate freely.
+ */
+export function rateLimitSubject(ip: string): string {
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped?.[1]) return mapped[1];
+  if (!ip.includes(":")) return ip;
+  return ipv6Prefix64(ip) ?? ip;
+}

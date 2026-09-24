@@ -3,6 +3,7 @@ export interface Env {
   ADMIN_PASSWORD: string;
   SESSION_SECRET: string;
   SITE_NAME?: string;
+  CANONICAL_ORIGIN?: string;
 }
 
 export interface IdentityRow {
@@ -29,5 +30,16 @@ export interface KeyRow {
 }
 
 export interface IdentityWithKeys extends IdentityRow {
+  keys: KeyRow[];
+}
+
+export interface InstallerSubject {
+  /** Immutable identity uid; null for handles retired before uids existed. */
+  uid: string | null;
+  handle: string;
+  /** Every handle this identity has used, for migrating legacy blocks. */
+  legacyHandles: string[];
+  /** False when the identity is hidden or deleted: the installer only revokes. */
+  published: boolean;
   keys: KeyRow[];
 }

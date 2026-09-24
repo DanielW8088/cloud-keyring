@@ -1,5 +1,12 @@
 import { ADMIN_JS, APP_JS, CSS } from "./assets";
-import { auditStatement, getPublicIdentity, listAllIdentities, listAuditEvents, listPublicIdentities } from "./db";
+import {
+  auditStatement,
+  getInstallerSubject,
+  getPublicIdentity,
+  listAllIdentities,
+  listAuditEvents,
+  listPublicIdentities,
+} from "./db";
 import {
   clearSessionCookie,
   createSessionCookie,
@@ -7,10 +14,11 @@ import {
   isSameOrigin,
   passwordsEqual,
   privacyHash,
+  rateLimitSubject,
 } from "./security";
 import { parsePublicKey } from "./ssh";
-import type { Env, IdentityRow, KeyRow } from "./types";
-import { renderAdmin, renderHome, renderIdentity, renderLogin } from "./views";
+import type { Env, InstallerSubject, KeyRow } from "./types";
+import { renderAdmin, renderError, renderHome, renderIdentity, renderLogin } from "./views";
 
 const SECURITY_HEADERS: Record<string, string> = {
   "content-security-policy":
@@ -21,6 +29,16 @@ const SECURITY_HEADERS: Record<string, string> = {
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
 };
+
+const MAX_JSON_BYTES = 20_000;
+const LOGIN_FREE_ATTEMPTS = 5;
+const LOGIN_BASE_LOCK_SECONDS = 30;
+const LOGIN_MAX_LOCK_SECONDS = 15 * 60;
+const LOGIN_FAILURE_WINDOW_SECONDS = 24 * 60 * 60;
+// Hostnames Cloudflare assigns to every deployment. Access policies bound to a
+// custom domain do not cover them, so the admin surface is never served there.
+const PLATFORM_HOST_SUFFIXES = [".pages.dev", ".workers.dev"];
+const HANDLE_TAKEN = "该 Handle 已被使用或保留";
 
 class HttpError extends Error {
   constructor(
@@ -61,6 +79,11 @@ function siteName(env: Env): string {
   return env.SITE_NAME?.trim().slice(0, 60) || "Cloud Keyring";
 }
 
+function canonicalOrigin(env: Env): string | null {
+  const value = env.CANONICAL_ORIGIN?.trim();
+  return value ? new URL(value).origin : null;
+}
+
 function validateConfiguration(env: Env): void {
   if (!env.ADMIN_PASSWORD || env.ADMIN_PASSWORD.length < 16) {
     throw new Error("ADMIN_PASSWORD must contain at least 16 characters");
@@ -68,22 +91,58 @@ function validateConfiguration(env: Env): void {
   if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32) {
     throw new Error("SESSION_SECRET must contain at least 32 characters");
   }
+  const canonical = env.CANONICAL_ORIGIN?.trim();
+  if (canonical) {
+    let url: URL | null = null;
+    try {
+      url = new URL(canonical);
+    } catch {
+      // Reported below.
+    }
+    if (!url || url.protocol !== "https:" || url.pathname !== "/" || url.search || url.hash || url.username) {
+      throw new Error("CANONICAL_ORIGIN must be an https:// origin without a path");
+    }
+  }
+}
+
+/** Reads at most `limit` bytes, cancelling the stream as soon as it is exceeded. */
+async function readBody(request: Request, limit: number): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (request.body) {
+    const reader = request.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => {});
+        throw new HttpError(413, "请求内容过大");
+      }
+      chunks.push(value);
+    }
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 async function readJson(request: Request): Promise<Record<string, unknown>> {
   const length = Number(request.headers.get("content-length") ?? 0);
-  if (length > 20_000) throw new HttpError(413, "请求内容过大");
+  if (length > MAX_JSON_BYTES) throw new HttpError(413, "请求内容过大");
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     throw new HttpError(415, "请求必须使用 application/json");
   }
+  const body = await readBody(request, MAX_JSON_BYTES);
   try {
-    const body = await request.text();
-    if (new TextEncoder().encode(body).byteLength > 20_000) throw new HttpError(413, "请求内容过大");
-    const value: unknown = JSON.parse(body);
+    const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
     return value as Record<string, unknown>;
-  } catch (error) {
-    if (error instanceof HttpError) throw error;
+  } catch {
     throw new HttpError(400, "JSON 请求无效");
   }
 }
@@ -155,36 +214,57 @@ async function requireAdmin(request: Request, env: Env): Promise<void> {
   }
 }
 
+/**
+ * Consumes one login attempt before the password is checked. The check and the
+ * increment are a single UPDATE, so concurrent requests cannot share a budget.
+ * Returns the attempt number, or null while the bucket is locked.
+ */
+async function reserveLoginAttempt(env: Env, bucket: string, now: number): Promise<number | null> {
+  const failures = "(CASE WHEN updated_at <= ?2 - ?3 THEN 1 ELSE failures + 1 END)";
+  const [, update] = await env.DB.batch([
+    env.DB.prepare(
+      "INSERT OR IGNORE INTO auth_attempts (bucket, failures, blocked_until, updated_at) VALUES (?1, 0, 0, ?2)",
+    ).bind(bucket, now),
+    env.DB.prepare(
+      `UPDATE auth_attempts SET
+         failures = ${failures},
+         blocked_until = CASE WHEN ${failures} >= ?4 THEN ?2 + min(?6, ?5 << min(${failures} - ?4, 5)) ELSE 0 END,
+         updated_at = ?2
+       WHERE bucket = ?1 AND blocked_until <= ?2
+       RETURNING failures`,
+    ).bind(
+      bucket,
+      now,
+      LOGIN_FAILURE_WINDOW_SECONDS,
+      LOGIN_FREE_ATTEMPTS,
+      LOGIN_BASE_LOCK_SECONDS,
+      LOGIN_MAX_LOCK_SECONDS,
+    ),
+  ]);
+  const row = update?.results?.[0] as { failures: number } | undefined;
+  return row ? row.failures : null;
+}
+
 async function login(request: Request, env: Env): Promise<Response> {
   if (!isSameOrigin(request)) throw new HttpError(403, "拒绝跨站请求");
   const data = await readJson(request);
   const password = stringField(data, "password", 1024);
-  const bucket = await privacyHash(env.SESSION_SECRET, `login:${actorIp(request)}`);
+  const bucket = await privacyHash(env.SESSION_SECRET, `login:${rateLimitSubject(actorIp(request))}`);
   const now = Math.floor(Date.now() / 1000);
-  const attempt = await env.DB.prepare(
-    "SELECT failures, blocked_until FROM auth_attempts WHERE bucket = ?",
-  )
-    .bind(bucket)
-    .first<{ failures: number; blocked_until: number }>();
-  if (attempt && attempt.blocked_until > now) {
-    throw new HttpError(429, "登录尝试过多，请稍后重试");
-  }
+  const attempt = await reserveLoginAttempt(env, bucket, now);
+  if (attempt === null) throw new HttpError(429, "登录尝试过多，请稍后重试");
 
   if (!(await passwordsEqual(password, env.ADMIN_PASSWORD))) {
-    const failures = (attempt?.blocked_until && attempt.blocked_until <= now ? 0 : attempt?.failures ?? 0) + 1;
-    const blockedUntil = failures >= 5 ? now + Math.min(15 * 60, 30 * 2 ** Math.min(failures - 5, 5)) : 0;
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO auth_attempts (bucket, failures, blocked_until, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(bucket) DO UPDATE SET failures = excluded.failures, blocked_until = excluded.blocked_until, updated_at = excluded.updated_at`,
-      ).bind(bucket, failures, blockedUntil, now),
-      auditStatement(env, "login.failed", "admin", `failure ${failures}`, await actorHash(request, env)),
-    ]);
+    await auditStatement(env, "login.failed", "admin", `attempt ${attempt}`, await actorHash(request, env)).run();
     throw new HttpError(401, "口令错误");
   }
 
   await env.DB.batch([
     env.DB.prepare("DELETE FROM auth_attempts WHERE bucket = ?").bind(bucket),
+    env.DB.prepare("DELETE FROM auth_attempts WHERE updated_at <= ? AND blocked_until <= ?").bind(
+      now - LOGIN_FAILURE_WINDOW_SECONDS,
+      now,
+    ),
     auditStatement(env, "login.succeeded", "admin", "", await actorHash(request, env)),
   ]);
   return json(
@@ -203,20 +283,23 @@ async function adminApi(request: Request, env: Env, path: string): Promise<Respo
   }
   if (path === "/api/admin/state" && request.method === "GET") {
     const [identities, audit] = await Promise.all([listAllIdentities(env), listAuditEvents(env)]);
-    return json({ identities, audit });
+    return json({ identities, audit: audit.events, loginFailures24h: audit.loginFailures24h });
   }
   if (path === "/api/identities" && request.method === "POST") {
     const fields = identityFields(await readJson(request));
+    const uid = crypto.randomUUID().replaceAll("-", "");
     const actor = await actorHash(request, env);
     try {
+      // The handle registry row reserves the handle for this identity forever.
       await env.DB.batch([
+        env.DB.prepare("INSERT INTO identity_handles (handle, identity_uid) VALUES (?, ?)").bind(fields.handle, uid),
         env.DB.prepare(
-          "INSERT INTO identities (handle, name, description, is_public) VALUES (?, ?, ?, ?)",
-        ).bind(fields.handle, fields.name, fields.description, fields.isPublic),
+          "INSERT INTO identities (uid, handle, name, description, is_public) VALUES (?, ?, ?, ?, ?)",
+        ).bind(uid, fields.handle, fields.name, fields.description, fields.isPublic),
         auditStatement(env, "identity.created", fields.handle, fields.name, actor),
       ]);
     } catch (error) {
-      if (String(error).includes("UNIQUE")) throw new HttpError(409, "该 Handle 已存在");
+      if (String(error).includes("UNIQUE")) throw new HttpError(409, HANDLE_TAKEN);
       throw error;
     }
     return json({ ok: true }, 201);
@@ -226,17 +309,27 @@ async function adminApi(request: Request, env: Env, path: string): Promise<Respo
   if (identityMatch && request.method === "PUT") {
     const id = integerId(identityMatch[1]);
     const fields = identityFields(await readJson(request));
-    const existing = await env.DB.prepare("SELECT handle FROM identities WHERE id = ?").bind(id).first<{ handle: string }>();
+    const existing = await env.DB.prepare("SELECT uid, handle FROM identities WHERE id = ?")
+      .bind(id)
+      .first<{ uid: string; handle: string }>();
     if (!existing) throw new HttpError(404, "身份不存在");
+    const owner = await env.DB.prepare("SELECT identity_uid FROM identity_handles WHERE handle = ?")
+      .bind(fields.handle)
+      .first<{ identity_uid: string | null }>();
+    if (owner && owner.identity_uid !== existing.uid) throw new HttpError(409, HANDLE_TAKEN);
     try {
       await env.DB.batch([
+        env.DB.prepare("INSERT OR IGNORE INTO identity_handles (handle, identity_uid) VALUES (?, ?)").bind(
+          fields.handle,
+          existing.uid,
+        ),
         env.DB.prepare(
           "UPDATE identities SET handle = ?, name = ?, description = ?, is_public = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
         ).bind(fields.handle, fields.name, fields.description, fields.isPublic, id),
         auditStatement(env, "identity.updated", fields.handle, `formerly ${existing.handle}`, await actorHash(request, env)),
       ]);
     } catch (error) {
-      if (String(error).includes("UNIQUE")) throw new HttpError(409, "该 Handle 已存在");
+      if (String(error).includes("UNIQUE")) throw new HttpError(409, HANDLE_TAKEN);
       throw error;
     }
     return json({ ok: true });
@@ -245,9 +338,11 @@ async function adminApi(request: Request, env: Env, path: string): Promise<Respo
     const id = integerId(identityMatch[1]);
     const existing = await env.DB.prepare("SELECT handle FROM identities WHERE id = ?").bind(id).first<{ handle: string }>();
     if (!existing) throw new HttpError(404, "身份不存在");
+    // identity_handles rows are kept: the handle stays reserved and its
+    // installer URL keeps serving a revocation script.
     await env.DB.batch([
       env.DB.prepare("DELETE FROM identities WHERE id = ?").bind(id),
-      auditStatement(env, "identity.deleted", existing.handle, "including all keys", await actorHash(request, env)),
+      auditStatement(env, "identity.deleted", existing.handle, "including all keys; handle stays reserved", await actorHash(request, env)),
     ]);
     return json({ ok: true });
   }
@@ -310,74 +405,147 @@ function rawKeys(keys: KeyRow[]): string {
   return keys.length ? `${keys.map((key) => key.public_key).join("\n")}\n` : "";
 }
 
-export function installer(identity: IdentityRow & { keys: KeyRow[] }, origin: string): string {
-  const marker = `cloud-keyring/${identity.handle}`;
-  const lines = rawKeys(identity.keys);
-  const fingerprints = identity.keys.map((key) => `#   ${key.fingerprint}`).join("\n");
+/**
+ * Generates the authorized_keys synchronizer for one identity.
+ *
+ * The managed block is marked with the identity's immutable uid. Blocks of
+ * other identities are never touched. A published key that already appears
+ * outside every block with authorized_keys options (restrict, command=,
+ * from=, ...) aborts the run without changes: publishing an unrestricted copy
+ * would lift those restrictions.
+ */
+export function installer(subject: InstallerSubject, origin: string): string {
+  const { handle, keys, published } = subject;
+  const lines = published ? rawKeys(keys) : "";
+  const fingerprints = keys.map((key) => `#   ${key.fingerprint}`).join("\n");
+  const summary = !published
+    ? "# This identity is no longer published. Running this script revokes its managed keys."
+    : fingerprints
+      ? `# Expected fingerprints:\n${fingerprints}`
+      : "# No public keys are currently published.";
+  const outcome = published
+    ? `@${handle}: synchronized ${keys.length} SSH public key(s).`
+    : `@${handle}: not published; removed its managed SSH public keys.`;
   return `#!/bin/sh
-# Synchronize SSH public keys for @${identity.handle}.
-# Source: ${origin}/${identity.handle}.keys
-${fingerprints ? `# Expected fingerprints:\n${fingerprints}` : "# No public keys are currently published."}
+# Synchronize SSH public keys for @${handle}.
+# Source: ${origin}/${handle}.sh
+${summary}
 set -eu
 umask 077
 
 SSH_DIR="$HOME/.ssh"
 AUTHORIZED_KEYS="$SSH_DIR/authorized_keys"
-BEGIN="# >>> ${marker} >>>"
-END="# <<< ${marker} <<<"
+IDENTITY_UID='${subject.uid ?? ""}'
+LEGACY_HANDLES='${subject.legacyHandles.join(" ")}'
 
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 touch "$AUTHORIZED_KEYS"
 chmod 600 "$AUTHORIZED_KEYS"
-cp "$AUTHORIZED_KEYS" "$AUTHORIZED_KEYS.keyring.bak"
-chmod 600 "$AUTHORIZED_KEYS.keyring.bak"
 
 KEYS_TMP=$(mktemp "$SSH_DIR/.keyring-keys.XXXXXX")
 OUTPUT_TMP=$(mktemp "$SSH_DIR/.keyring-output.XXXXXX")
-cleanup() { rm -f "$KEYS_TMP" "$OUTPUT_TMP"; }
+REPORT_TMP=$(mktemp "$SSH_DIR/.keyring-report.XXXXXX")
+cleanup() { rm -f "$KEYS_TMP" "$OUTPUT_TMP" "$REPORT_TMP"; }
 trap cleanup EXIT HUP INT TERM
 
 cat > "$KEYS_TMP" <<'CLOUD_KEYRING_KEYS'
 ${lines}CLOUD_KEYRING_KEYS
 
-awk -v begin="$BEGIN" -v end="$END" '
-  function key_id(line, fields, count, position) {
-    count = split(line, fields, /[ \t]+/)
-    for (position = 1; position < count; position++) {
-      if (fields[position] ~ /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$/) {
-        return fields[position] " " fields[position + 1]
-      }
-    }
-    return ""
+STATUS=0
+awk -v uid="$IDENTITY_UID" -v legacy="$LEGACY_HANDLES" -v report="$REPORT_TMP" '
+  function algorithm(value) {
+    return value ~ /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\\.com|sk-ecdsa-sha2-nistp256@openssh\\.com)$/
+  }
+  function key_fields(line, fields, copy) {
+    copy = line
+    sub(/^[ \\t]+/, "", copy)
+    return split(copy, fields, /[ \\t]+/)
+  }
+  BEGIN {
+    count = split(legacy, names, " ")
+    for (i = 1; i <= count; i++) own["cloud-keyring/" names[i]] = 1
+    if (uid != "") own["cloud-keyring:id=" uid] = 1
   }
   reading_existing != 1 {
-    id = key_id($0)
-    if (id != "") managed[id] = 1
+    if (key_fields($0, fields) >= 2 && algorithm(fields[1])) managed[fields[1] " " fields[2]] = 1
     next
   }
-  $0 == begin { skip = 1; next }
-  $0 == end { skip = 0; next }
-  skip { next }
-  {
-    id = key_id($0)
-    if (id == "" || !(id in managed)) print
+  block == "" && $0 ~ /^# >>> cloud-keyring(:|\\/)[^ ]+ >>>$/ {
+    block = $3
+    mine = (block in own)
+    if (!mine) {
+      if (substr(block, 14, 1) == "/") print "notice: kept legacy block " block "; run the installer of that handle to migrate it" > report
+      print
+    }
+    next
   }
-' "$KEYS_TMP" reading_existing=1 "$AUTHORIZED_KEYS" > "$OUTPUT_TMP"
+  block != "" {
+    if (!mine) print
+    if ($0 == "# <<< " block " <<<") block = ""
+    next
+  }
+  {
+    count = key_fields($0, fields)
+    if (count < 2 || fields[1] ~ /^#/) { print; next }
+    if (algorithm(fields[1])) {
+      # A plain copy of a published key is replaced by the managed block.
+      if ((fields[1] " " fields[2]) in managed) next
+      print
+      next
+    }
+    for (position = 2; position < count; position++) {
+      if (algorithm(fields[position]) && ((fields[position] " " fields[position + 1]) in managed)) {
+        print "conflict: line " FNR " grants a published key with authorized_keys options" > report
+        conflicts++
+        break
+      }
+    }
+    print
+  }
+  END {
+    if (block != "") {
+      print "error: block " block " has no end marker" > report
+      exit 2
+    }
+    if (conflicts) exit 3
+  }
+' "$KEYS_TMP" reading_existing=1 "$AUTHORIZED_KEYS" > "$OUTPUT_TMP" || STATUS=$?
 
-{
-  printf '%s\\n' "$BEGIN"
-  cat "$KEYS_TMP"
-  printf '%s\\n' "$END"
-} >> "$OUTPUT_TMP"
+if [ -s "$REPORT_TMP" ]; then
+  sed 's/^/cloud-keyring: /' "$REPORT_TMP" >&2
+fi
+if [ "$STATUS" -ne 0 ]; then
+  if [ "$STATUS" -eq 3 ]; then
+    printf '%s\\n' "cloud-keyring: publishing an unrestricted copy would lift the options on those lines." >&2
+    printf '%s\\n' "cloud-keyring: remove the options entry or stop publishing that key, then run this script again." >&2
+  fi
+  printf '%s\\n' "cloud-keyring: $AUTHORIZED_KEYS was not modified." >&2
+  exit "$STATUS"
+fi
 
-mv "$OUTPUT_TMP" "$AUTHORIZED_KEYS"
-chmod 600 "$AUTHORIZED_KEYS"
-printf '%s\\n' '@${identity.handle}: synchronized ${identity.keys.length} SSH public key(s).'
+if [ -n "$IDENTITY_UID" ] && [ -s "$KEYS_TMP" ]; then
+  {
+    printf '%s\\n' "# >>> cloud-keyring:id=$IDENTITY_UID >>>"
+    printf '%s\\n' '# @${handle}: managed by Cloud Keyring; edits inside this block are overwritten'
+    cat "$KEYS_TMP"
+    printf '%s\\n' "# <<< cloud-keyring:id=$IDENTITY_UID <<<"
+  } >> "$OUTPUT_TMP"
+fi
+
+if ! cmp -s "$OUTPUT_TMP" "$AUTHORIZED_KEYS"; then
+  BACKUP=$(mktemp "$AUTHORIZED_KEYS.keyring-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
+  cat "$AUTHORIZED_KEYS" > "$BACKUP"
+  chmod 600 "$OUTPUT_TMP"
+  mv "$OUTPUT_TMP" "$AUTHORIZED_KEYS"
+  # Keep the ten most recent backups.
+  ls -1 "$AUTHORIZED_KEYS".keyring-* 2>/dev/null | sort -r | awk 'NR > 10' | while IFS= read -r old; do rm -f "$old"; done
+fi
+printf '%s\\n' '${outcome}'
 `;
 }
 
-async function publicRoute(request: Request, env: Env, path: string): Promise<Response> {
+async function publicRoute(request: Request, env: Env, path: string, origin: string): Promise<Response> {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return response("Method not allowed\n", 405, { allow: "GET, HEAD", "content-type": "text/plain; charset=utf-8" });
   }
@@ -401,26 +569,38 @@ async function publicRoute(request: Request, env: Env, path: string): Promise<Re
 
   const match = path.match(/^\/([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)(\.(?:keys|sh))?$/);
   if (!match) throw new HttpError(404, "页面不存在");
+  if (match[2] === ".sh") {
+    const subject = await getInstallerSubject(env, match[1] ?? "");
+    if (!subject) throw new HttpError(404, "身份不存在");
+    return text(installer(subject, origin), "text/x-shellscript; charset=utf-8");
+  }
   const identity = await getPublicIdentity(env, match[1] ?? "");
   if (!identity) throw new HttpError(404, "身份不存在");
   if (match[2] === ".keys") return text(rawKeys(identity.keys));
-  if (match[2] === ".sh") return text(installer(identity, new URL(request.url).origin), "text/x-shellscript; charset=utf-8");
-  return html(renderIdentity(siteName(env), identity, new URL(request.url).origin));
+  return html(renderIdentity(siteName(env), identity, origin));
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   try {
     validateConfiguration(env);
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const canonical = canonicalOrigin(env);
+    const offCanonical = canonical
+      ? url.origin !== canonical
+      : PLATFORM_HOST_SUFFIXES.some((suffix) => url.hostname.endsWith(suffix));
+    if (offCanonical) {
+      if (path === "/admin" || path.startsWith("/api/")) throw new HttpError(404, "页面不存在");
+      if (canonical && (request.method === "GET" || request.method === "HEAD")) {
+        return response(null, 308, { "cache-control": "no-store", location: `${canonical}${path}${url.search}` });
+      }
+    }
     if (path.startsWith("/api/")) return await adminApi(request, env, path);
-    return await publicRoute(request, env, path);
+    return await publicRoute(request, env, path, canonical ?? url.origin);
   } catch (error) {
     if (error instanceof HttpError) {
       if (new URL(request.url).pathname.startsWith("/api/")) return json({ error: error.message }, error.status);
-      return html(
-        `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${error.status}</title><link rel="stylesheet" href="/assets/app.css"><main class="login-wrap"><section class="login"><span class="eyebrow">ERROR ${error.status}</span><h1>${error.status}</h1><p>${error.message}</p><a class="btn" href="/">返回目录</a></section></main></html>`,
-        error.status,
-      );
+      return html(renderError(error.status, error.message), error.status);
     }
     console.error("Unhandled request error", error);
     return json({ error: "服务器内部错误" }, 500);

@@ -44,13 +44,14 @@ if (loginForm) loginForm.addEventListener('submit', async (event) => {
 });
 
 const app = $('#admin-app');
-let state = { identities: [], audit: [] };
+let state = { identities: [], audit: [], loginFailures24h: 0 };
 const keyHtml = key => '<div class="key-admin"><div><strong>' + escapeHtml(key.label || key.key_comment || key.key_type) + '</strong><code>' + escapeHtml(key.fingerprint) + '</code></div><button class="btn danger small" data-delete-key="' + key.id + '">删除</button></div>';
 const identityHtml = identity => '<details class="admin-identity" data-identity="' + identity.id + '"><summary><div><strong>' + escapeHtml(identity.name) + '</strong><span>@' + escapeHtml(identity.handle) + ' · ' + identity.keys.length + ' keys</span></div><span class="visibility">' + (identity.is_public ? '公开' : '隐藏') + '</span></summary><div class="identity-editor"><form class="edit-identity form-grid"><div class="field"><label>名称</label><input name="name" maxlength="80" required value="' + escapeHtml(identity.name) + '"></div><div class="field"><label>Handle</label><input name="handle" maxlength="32" pattern="[a-z0-9][a-z0-9-]{0,31}" required value="' + escapeHtml(identity.handle) + '"></div><div class="field wide"><label>简介</label><textarea name="description" maxlength="240" rows="2">' + escapeHtml(identity.description) + '</textarea></div><div class="field"><label>可见性</label><select name="isPublic"><option value="true"' + (identity.is_public ? ' selected' : '') + '>公开</option><option value="false"' + (!identity.is_public ? ' selected' : '') + '>隐藏</option></select></div><div class="actions wide"><button class="btn primary" type="submit">保存身份</button><button class="btn" type="button" data-add-key="' + identity.id + '">添加公钥</button><button class="btn danger" type="button" data-delete-identity="' + identity.id + '">删除身份</button></div></form><div class="key-admin-list">' + (identity.keys.map(keyHtml).join('') || '<p class="empty">尚无公钥</p>') + '</div></div></details>';
 const render = () => {
   $('#identity-list').innerHTML = state.identities.map(identityHtml).join('') || '<p class="empty">创建第一个身份开始使用。</p>';
   $('#identity-total').textContent = state.identities.length;
   $('#key-total').textContent = state.identities.reduce((sum, identity) => sum + identity.keys.length, 0);
+  $('#login-failures').textContent = state.loginFailures24h ? '24h 登录失败 ' + state.loginFailures24h : '';
   $('#audit-list').innerHTML = state.audit.map(event => '<div class="audit-item"><strong>' + escapeHtml(event.action) + '</strong><p>' + escapeHtml(event.target) + (event.detail ? ' · ' + escapeHtml(event.detail) : '') + '</p><time>' + escapeHtml(event.created_at) + ' · ' + escapeHtml(event.actor_hash) + '</time></div>').join('') || '<p class="empty">暂无操作记录</p>';
 };
 const load = async () => { state = await request('/api/admin/state'); render(); };
@@ -76,7 +77,7 @@ if (app) {
   $('#identity-list').addEventListener('click', async event => {
     const add = event.target.closest('[data-add-key]'); if (add) { $('#create-key').identityId.value = add.dataset.addKey; $('#key-dialog').showModal(); return; }
     const key = event.target.closest('[data-delete-key]'); if (key && confirm('确认删除这把公钥？删除后公开端点将不再提供它。')) { try { await request('/api/keys/' + key.dataset.deleteKey, { method: 'DELETE', body: '{}' }); await load(); toast('公钥已删除'); } catch (reason) { toast(reason.message, true); } return; }
-    const identity = event.target.closest('[data-delete-identity]'); if (identity && confirm('确认删除该身份及其全部公钥？此操作不可撤销。')) { try { await request('/api/identities/' + identity.dataset.deleteIdentity, { method: 'DELETE', body: '{}' }); await load(); toast('身份已删除'); } catch (reason) { toast(reason.message, true); } }
+    const identity = event.target.closest('[data-delete-identity]'); if (identity && confirm('确认删除该身份及其全部公钥？已同步的服务器在下次运行同步脚本时会移除这些公钥；该 Handle 将永久保留，不能再分配给其他身份。此操作不可撤销。')) { try { await request('/api/identities/' + identity.dataset.deleteIdentity, { method: 'DELETE', body: '{}' }); await load(); toast('身份已删除'); } catch (reason) { toast(reason.message, true); } }
   });
 }
 `;
